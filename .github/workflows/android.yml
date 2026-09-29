@@ -50,6 +50,9 @@ jobs:
                      "build-tools;33.0.0" "build-tools;34.0.0" "build-tools;35.0.0" || true
           sudo apt-get install -y imagemagick unzip > /dev/null 2>&1 || true
 
+      # ============================================================
+      # DOWNLOAD ZIP
+      # ============================================================
       - name: Download project ZIP
         run: |
           mkdir -p project
@@ -57,6 +60,13 @@ jobs:
           echo "⬇️ Download: ${{ inputs.zip_url }}"
           curl -fsSL "${{ inputs.zip_url }}" -o project.zip
           ls -lh project.zip
+
+          SIZE=$(stat -c%s project.zip 2>/dev/null || stat -f%z project.zip)
+          if [ "$SIZE" -lt 100 ]; then
+            echo "❌ ZIP terlalu kecil ($SIZE bytes), kemungkinan corrupt."
+            file project.zip
+            exit 1
+          fi
 
           unzip -q project.zip || {
             echo "❌ Gagal unzip. File mungkin bukan ZIP valid."
@@ -67,47 +77,99 @@ jobs:
           echo "📁 Isi project:"
           ls -la
 
-      - name: Auto-detect project root
+      # ============================================================
+      # AUTO-DETECT + VALIDASI STRICT
+      # Minimal HARUS ada salah satu:
+      #   1. build.gradle / build.gradle.kts di root
+      #   2. settings.gradle / settings.gradle.kts di root
+      #   3. folder app/ + app/build.gradle
+      # ============================================================
+      - name: Validate & detect project root
         id: detect
         run: |
           cd project
 
-          if [ -f "gradlew" ] || [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
-            ROOT="."
-          else
-            SUB=$(find . -maxdepth 2 -type f \( -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -1)
-            if [ -n "$SUB" ]; then
-              ROOT=$(dirname "$SUB")
-            else
-              ROOT=""
+          echo "🔍 Scanning project structure..."
+          echo "--- File gradle ditemukan: ---"
+          find . -maxdepth 3 \( -name "*.gradle" -o -name "*.gradle.kts" \) -type f 2>/dev/null | head -20 || true
+          echo "--- Folder 'app' ditemukan: ---"
+          find . -maxdepth 3 -type d -name "app" 2>/dev/null | head -5 || true
+          echo "--------------------------------"
+
+          WORKDIR="."
+          HAS_BUILD=false
+          HAS_SETTINGS=false
+          HAS_APP=false
+
+          check_dir() {
+            local d="$1"
+            [ -f "$d/build.gradle" ] || [ -f "$d/build.gradle.kts" ] && HAS_BUILD=true
+            [ -f "$d/settings.gradle" ] || [ -f "$d/settings.gradle.kts" ] && HAS_SETTINGS=true
+            [ -d "$d/app" ] && HAS_APP=true
+          }
+
+          check_dir "."
+
+          if [ "$HAS_BUILD" = false ] && [ "$HAS_SETTINGS" = false ] && [ "$HAS_APP" = false ]; then
+            CANDIDATE=$(find . -maxdepth 2 -type f \( -name "build.gradle" -o -name "build.gradle.kts" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -1)
+            if [ -n "$CANDIDATE" ]; then
+              CANDIDATE_DIR=$(dirname "$CANDIDATE")
+              echo "📁 Coba root alternatif: $CANDIDATE_DIR"
+              WORKDIR="$CANDIDATE_DIR"
+              HAS_BUILD=false
+              HAS_SETTINGS=false
+              HAS_APP=false
+              check_dir "$WORKDIR"
             fi
           fi
 
-          if [ -z "$ROOT" ]; then
-            echo "❌ Tidak menemukan project Android (gradlew/settings.gradle)"
-            echo "📁 Struktur 3 level:"
-            find . -maxdepth 3 -type f | head -30
+          if [ "$HAS_BUILD" = false ] && [ "$HAS_SETTINGS" = false ] && [ "$HAS_APP" = false ]; then
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║                                                              ║"
+            echo "║   ❌  ZIP TIDAK VALID — BUKAN PROJECT ANDROID                ║"
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "📋 ZIP kamu WAJIB berisi minimal SALAH SATU dari:"
+            echo ""
+            echo "   1) build.gradle        atau  build.gradle.kts"
+            echo "   2) settings.gradle     atau  settings.gradle.kts"
+            echo "   3) folder 'app/'  yang berisi  app/build.gradle"
+            echo ""
+            echo "📁 Isi ZIP kamu saat ini:"
+            echo "---------------------------------------------"
+            find . -maxdepth 3 -type f 2>/dev/null | head -30
+            echo "---------------------------------------------"
+            echo ""
+            echo "💡 Tips:"
+            echo "   • Kalau project dari Android Studio:"
+            echo "     File → Export → Zip,  atau compress folder project"
+            echo "   • Pastikan file .gradle ada di root folder ZIP"
+            echo ""
             exit 1
           fi
 
-          echo "✅ Project root: $ROOT"
-          echo "root=$ROOT" >> $GITHUB_OUTPUT
+          echo ""
+          echo "✅ ZIP terdeteksi sebagai project Android"
+          echo "   ├─ build.gradle      : $HAS_BUILD"
+          echo "   ├─ settings.gradle   : $HAS_SETTINGS"
+          echo "   └─ folder 'app/'     : $HAS_APP"
+          echo ""
+
+          REL_ROOT=$(echo "$WORKDIR" | sed 's|^\./||;s|^\.$|.|')
+          echo "✅ Project root: $REL_ROOT"
+          echo "root=$REL_ROOT" >> $GITHUB_OUTPUT
 
       # ============================================================
-      # STEP KRUSIAL: Auto-generate / patch Gradle files
-      # Handle 5 skenario berbeda:
-      #   1. settings.gradle tidak ada → create
-      #   2. settings.gradle ada tapi kurang repos → patch
-      #   3. build.gradle root tidak ada → create
-      #   4. build.gradle root ada tapi kurang repos → patch
-      #   5. app/ tidak ada → warning
+      # PATCH / AUTO-CREATE FILE GRADLE YANG HILANG
       # ============================================================
       - name: Patch / Auto-create Gradle files
         working-directory: project/${{ steps.detect.outputs.root }}
         run: |
           echo "🔍 Cek file Gradle..."
 
-          # --- CASE 1: settings.gradle gak ada → CREATE ---
+          # --- CASE 1: settings.gradle gak ada ---
           if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
             echo "📝 settings.gradle tidak ada, buat baru..."
             cat > settings.gradle <<'EOF'
@@ -131,7 +193,7 @@ jobs:
           EOF
           fi
 
-          # --- CASE 2: settings.gradle ADA tapi kurang repos ---
+          # --- CASE 2: settings.gradle ada tapi kurang repos ---
           if [ -f "settings.gradle" ]; then
             if ! grep -q "dependencyResolutionManagement" settings.gradle && \
                ! grep -q "pluginManagement" settings.gradle; then
@@ -159,7 +221,7 @@ jobs:
             fi
           fi
 
-          # --- CASE 3: build.gradle root gak ada → CREATE ---
+          # --- CASE 3: build.gradle root gak ada ---
           if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
             echo "📝 build.gradle root tidak ada, buat baru..."
             cat > build.gradle <<'EOF'
@@ -182,7 +244,7 @@ jobs:
           EOF
           fi
 
-          # --- CASE 4: build.gradle ADA tapi kurang repos ---
+          # --- CASE 4: build.gradle ada tapi kurang repos ---
           if [ -f "build.gradle" ]; then
             if ! grep -q "allprojects" build.gradle && \
                ! grep -q "buildscript" build.gradle; then
@@ -214,7 +276,6 @@ jobs:
           # --- CASE 5: app/ gak ada ---
           if [ ! -d "app" ]; then
             echo "⚠️ Warning: folder 'app/' tidak ditemukan!"
-            echo "Isi project:"
             ls -la
           fi
 
@@ -225,7 +286,7 @@ jobs:
           cat build.gradle 2>/dev/null || cat build.gradle.kts 2>/dev/null || echo "(tidak ada)"
 
       # ============================================================
-      # Ensure gradle wrapper ada
+      # ENSURE GRADLE WRAPPER
       # ============================================================
       - name: Ensure Gradle wrapper exists
         working-directory: project/${{ steps.detect.outputs.root }}
@@ -257,7 +318,7 @@ jobs:
           ls -la gradlew gradle/wrapper/ || true
 
       # ============================================================
-      # Setup local.properties
+      # SETUP local.properties
       # ============================================================
       - name: Setup local.properties
         working-directory: project/${{ steps.detect.outputs.root }}
@@ -267,7 +328,7 @@ jobs:
           cat local.properties
 
       # ============================================================
-      # Apply custom icon (opsional)
+      # APPLY CUSTOM ICON (opsional)
       # ============================================================
       - name: Apply custom icon
         if: inputs.icon_url != ''
@@ -312,7 +373,7 @@ jobs:
           echo "✅ Icon terpasang"
 
       # ============================================================
-      # Build APK
+      # BUILD APK
       # ============================================================
       - name: Build APK
         working-directory: project/${{ steps.detect.outputs.root }}
@@ -324,7 +385,7 @@ jobs:
           fi
 
       # ============================================================
-      # Collect & rename APK
+      # COLLECT & RENAME APK
       # ============================================================
       - name: Collect APK
         run: |
@@ -347,7 +408,7 @@ jobs:
           ls -lh
 
       # ============================================================
-      # Upload artifact
+      # UPLOAD ARTIFACT
       # ============================================================
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
