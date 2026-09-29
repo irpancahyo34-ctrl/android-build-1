@@ -1,0 +1,127 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL ZIP project Android Studio'
+        required: true
+        type: string
+      tag:
+        description: 'Build tag'
+        required: true
+        type: string
+      build_type:
+        description: 'debug / release'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ✅ Setup Android SDK (fix error 'tools not found')
+      - name: Setup Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          echo "✅ Android SDK: $ANDROID_SDK_ROOT"
+
+      - name: Install Android platform & build-tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true
+
+      - name: Download & extract project
+        run: |
+          mkdir -p project
+          cd project
+          echo "⬇️ Download: ${{ inputs.zip_url }}"
+          curl -fsSL "${{ inputs.zip_url }}" -o project.zip
+          ls -lh project.zip
+          unzip -q project.zip
+          rm project.zip
+          echo "📁 Isi project:"
+          ls -la
+
+      - name: Auto-detect project root
+        id: detect
+        run: |
+          cd project
+          # Cari folder yang punya gradlew atau settings.gradle
+          ROOT=""
+          if [ -f "gradlew" ] || [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            ROOT="."
+          else
+            # Cek 1 level lebih dalam (biasanya hasil unzip ada 1 folder)
+            SUB=$(find . -maxdepth 2 -type f \( -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -1 | xargs -r dirname)
+            if [ -n "$SUB" ]; then
+              ROOT="$SUB"
+            fi
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "❌ Tidak menemukan project Android (gradlew/settings.gradle)"
+            echo "📁 Struktur folder:"
+            find . -maxdepth 3 -type f | head -30
+            exit 1
+          fi
+
+          echo "✅ Project root: $ROOT"
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
+
+      - name: Fix gradlew permission & local.properties
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          chmod +x gradlew || true
+          # Bikin local.properties kalau belum ada
+          if [ ! -f "local.properties" ]; then
+            echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          fi
+          cat local.properties
+
+      - name: Build APK
+        working-directory: project/${{ steps.detect.outputs.root }}
+        run: |
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          # Cari semua APK hasil build
+          find project -type f -name "*.apk" -exec cp {} output/ \;
+          echo "📦 APK ditemukan:"
+          ls -lh output/
+
+      - name: Rename APK (biar rapi)
+        run: |
+          cd output
+          for f in *.apk; do
+            NEW_NAME="${{ inputs.tag }}-$f"
+            mv "$f" "$NEW_NAME"
+          done
+          ls -lh
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: output/*.apk
+          retention-days: 7
